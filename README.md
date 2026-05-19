@@ -16,3 +16,8 @@ Also, I've downloaded the CircuitPython bundle and community bundle:
 - https://github.com/adafruit/Adafruit_CircuitPython_Bundle/releases/download/20260508/adafruit-circuitpython-bundle-10.x-mpy-20260508.zip
 - https://github.com/adafruit/CircuitPython_Community_Bundle
 
+Things to improve next time: 
+- A built-in timer off for the OLED display
+- read-only bootable Pico, so it won't connect itself as a usb pendrive each time
+- I'm still choosing the functions for the Macropad, so I think I can add some more layers to it
+- maybe to show the name of the functions on the display? or if you keep pushing a selected button, it can show the list of functions, but don't know how yet. Maybe in this repo?
