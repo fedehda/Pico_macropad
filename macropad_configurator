@@ -1,0 +1,1157 @@
+import customtkinter as ctk
+from tkinter import filedialog
+import serial
+import serial.tools.list_ports
+import json
+import threading
+import keyboard  # REQUIERE: pip install keyboard
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+AVAILABLE_ICONS = ["MONITOR", "CAMERA", "GAMEPAD", "MUSIC", "FOLDER", "CODE"]
+NEW_ICON_SENTINEL = "➕ Nuevo Ícono..."
+
+PRESET_SPECIAL_KEYS = [
+    "--- MUTE/AUDIO ---", "VOL_UP", "VOL_DOWN", "MUTE", "PLAY_PAUSE", "NEXT_TRACK", "PREV_TRACK",
+    "--- TECLAS F EXTENDIDAS ---", "F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
+    "--- SISTEMA ---", "CALCULATOR", "BROWSER_HOME", "MEDIA_SELECT", "PRINT_SCREEN"
+]
+
+# Cantidad de encoders EC11 físicos
+NUM_ENCODERS = 2
+
+def default_encoders():
+    """Genera la config por defecto de los encoders para una capa nueva."""
+    return [
+        {"ccw": "VOL_DOWN", "cw": "VOL_UP", "push": "MUTE"},
+        {"ccw": "PREV_TRACK", "cw": "NEXT_TRACK", "push": "PLAY_PAUSE"}
+    ][:NUM_ENCODERS]
+
+
+class MacropadConfigurator(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Macropad Configurator v3.5 - Guardar/Cargar Configuración")
+        self.geometry("880x760")
+        self.resizable(False, False)
+
+        self.serial_port = None
+        self.active_layer_index = 0
+
+        # Target actualmente en modo "escuchando tecla".
+        # Puede ser: ("btn", idx)  -> uno de los 9 botones
+        #            ("enc", enc_idx, "cw"/"ccw"/"push") -> acción de un encoder
+        self.capturing_target = None
+
+        # Los encoders se configuran en una ventana emergente (para poder mostrarlos
+        # en horizontal sin romper el layout angosto tipo teclado físico).
+        self.encoder_cards = {}          # enc_idx -> {"summary_lbl": widget}
+        self.encoder_popup_widgets = {}  # enc_idx -> widgets dict, solo mientras el popup está abierto
+        self.encoder_popup_windows = {}  # enc_idx -> ventana Toplevel, solo mientras está abierta
+
+        self.config_data = {
+            "layers": [
+                {
+                    "name": "STREAM",
+                    "icon": "CAMERA",
+                    "keys": ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21"],
+                    "encoders": [
+                        {"ccw": "VOL_DOWN", "cw": "VOL_UP", "push": "MUTE"},
+                        {"ccw": "PREV_TRACK", "cw": "NEXT_TRACK", "push": "PLAY_PAUSE"}
+                    ]
+                },
+                {
+                    "name": "WORK",
+                    "icon": "MONITOR",
+                    "keys": ["Ctrl+Z", "Ctrl+Y", "Ctrl+Shift+S", "Ctrl+C", "Ctrl+V", "Ctrl+X", "Win+Shift+S", "Ctrl+`", "Alt+F4"],
+                    "encoders": [
+                        {"ccw": "Ctrl+-", "cw": "Ctrl+=", "push": "Ctrl+0"},
+                        {"ccw": "VOL_DOWN", "cw": "VOL_UP", "push": "MUTE"}
+                    ]
+                },
+                {
+                    "name": "GAMING",
+                    "icon": "GAMEPAD",
+                    "keys": ["Ctrl+Shift+M", "Ctrl+Shift+D", "Win+PrtSc", "Alt+Z", "Win+G", "Alt+Tab", "Ctrl+Alt+Up", "Ctrl+Alt+Down", "F12"],
+                    "encoders": [
+                        {"ccw": "VOL_DOWN", "cw": "VOL_UP", "push": "MUTE"},
+                        {"ccw": "F14", "cw": "F15", "push": "F16"}
+                    ]
+                },
+                {
+                    "name": "MEDIA",
+                    "icon": "MUSIC",
+                    "keys": ["VOL_UP", "VOL_DOWN", "MUTE", "PLAY_PAUSE", "NEXT_TRACK", "PREV_TRACK", "CALCULATOR", "Ctrl+T", "Ctrl+W"],
+                    "encoders": [
+                        {"ccw": "VOL_DOWN", "cw": "VOL_UP", "push": "MUTE"},
+                        {"ccw": "PREV_TRACK", "cw": "NEXT_TRACK", "push": "PLAY_PAUSE"}
+                    ]
+                }
+            ],
+            "custom_icons": {}  # nombre -> bitmap 16x16 (0/1) dibujado en el mini editor de píxeles
+        }
+
+        self.setup_ui()
+        self.find_pico_port()
+        self.refresh_layers_list()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+    def setup_ui(self):
+        # Header
+        self.header_frame = ctk.CTkFrame(self, height=50, corner_radius=0)
+        self.header_frame.pack(fill="x", side="top")
+
+        self.title_lbl = ctk.CTkLabel(self.header_frame, text="🎛️ Macropad Studio", font=("Arial", 20, "bold"))
+        self.title_lbl.pack(side="left", padx=20, pady=10)
+
+        self.status_lbl = ctk.CTkLabel(self.header_frame, text="Buscando Pico...", text_color="yellow")
+        self.status_lbl.pack(side="right", padx=20, pady=10)
+
+        self.btn_reconnect = ctk.CTkButton(
+            self.header_frame, text="🔄 Reconectar", width=120, height=28,
+            fg_color="#2b6cb0", hover_color="#1f538d",
+            command=self.reconnect_pico
+        )
+        self.btn_reconnect.pack(side="right", padx=(0, 5), pady=10)
+
+        self.main_container = ctk.CTkFrame(self)
+        self.main_container.pack(fill="both", expand=True, padx=15, pady=15)
+
+        # --- LATERAL IZQUIERDO ---
+        self.left_panel = ctk.CTkFrame(self.main_container, width=190)
+        self.left_panel.pack(side="left", fill="y", padx=8, pady=10)
+
+        ctk.CTkLabel(self.left_panel, text="Capas Disponibles", font=("Arial", 14, "bold")).pack(pady=10)
+
+        self.layers_scroll = ctk.CTkScrollableFrame(self.left_panel, width=155, height=340)
+        self.layers_scroll.pack(pady=5, padx=5, fill="both", expand=True)
+
+        self.btn_add_layer = ctk.CTkButton(self.left_panel, text="➕ Nueva Capa", command=self.add_layer, fg_color="green", hover_color="darkgreen")
+        self.btn_add_layer.pack(pady=5, padx=10, fill="x")
+
+        self.btn_del_layer = ctk.CTkButton(self.left_panel, text="🗑️ Eliminar Capa", command=self.delete_layer, fg_color="firebrick", hover_color="darkred")
+        self.btn_del_layer.pack(pady=5, padx=10, fill="x")
+
+        self.btn_save_config = ctk.CTkButton(self.left_panel, text="💾 Guardar Config", command=self.save_config_to_file, fg_color="#2b6cb0", hover_color="#1f538d")
+        self.btn_save_config.pack(pady=(15, 5), padx=10, fill="x")
+
+        self.btn_load_config = ctk.CTkButton(self.left_panel, text="📂 Cargar Config", command=self.load_config_from_file, fg_color="#2b6cb0", hover_color="#1f538d")
+        self.btn_load_config.pack(pady=5, padx=10, fill="x")
+
+        # --- PANEL DERECHO ---
+        self.right_panel = ctk.CTkFrame(self.main_container)
+        self.right_panel.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        self.meta_frame = ctk.CTkFrame(self.right_panel)
+        self.meta_frame.pack(fill="x", padx=15, pady=10)
+
+        ctk.CTkLabel(self.meta_frame, text="Nombre:").pack(side="left", padx=(10, 2))
+        self.layer_name_entry = ctk.CTkEntry(self.meta_frame, width=130)
+        self.layer_name_entry.pack(side="left", padx=5, pady=8)
+        self.layer_name_entry.bind("<KeyRelease>", self.update_active_layer_name)
+
+        ctk.CTkLabel(self.meta_frame, text="Ícono OLED:").pack(side="left", padx=(15, 2))
+        self.icon_menu = ctk.CTkOptionMenu(self.meta_frame, values=AVAILABLE_ICONS + [NEW_ICON_SENTINEL], command=self.update_active_layer_icon, width=140)
+        self.icon_menu.pack(side="left", padx=5, pady=8)
+
+        self.btn_edit_icon = ctk.CTkButton(self.meta_frame, text="✏️ Editar", width=70, height=26,
+                                            command=self.edit_current_icon, fg_color="#555555", hover_color="#444444")
+        self.btn_edit_icon.pack(side="left", padx=5, pady=8)
+
+        self.info_lbl = ctk.CTkLabel(self.right_panel, text="💡 Toca cualquier botón para capturar un atajo del sistema sin que interfiera con otros programas", text_color="gray", font=("Arial", 11))
+        self.info_lbl.pack(pady=2)
+
+        # --- GRILLA UNIFICADA (imita la disposición física del macropad) ---
+        # Columnas 0-2: botones 1-9 en 3x3
+        # Columna 3: pantalla OLED (fila 0, junto al Botón 3), Encoder 1 (fila 1, junto al Botón 6),
+        #            Encoder 2 (fila 2, junto al Botón 9)
+        self.grid_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
+        self.grid_frame.pack(pady=(8, 8))
+
+        self.grid_buttons = []
+        self.grid_dropdowns = []
+
+        for row in range(3):
+            for col in range(3):
+                idx = row * 3 + col
+                card = ctk.CTkFrame(self.grid_frame)
+                card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
+
+                ctk.CTkLabel(card, text=f"Botón {idx+1}", font=("Arial", 11, "bold")).pack(pady=2)
+
+                btn = ctk.CTkButton(
+                    card, text="F13", width=100, height=32,
+                    fg_color="#2b2b2b", hover_color="#3b3b3b",
+                    command=lambda i=idx: self.start_capturing(("btn", i))
+                )
+                btn.pack(pady=3, padx=5)
+                self.grid_buttons.append(btn)
+
+                combo = ctk.CTkOptionMenu(
+                    card, values=["Especial..."] + PRESET_SPECIAL_KEYS,
+                    width=100, height=20, font=("Arial", 9),
+                    command=lambda val, i=idx: self.assign_preset(("btn", i), val)
+                )
+                combo.pack(pady=(0, 5), padx=5)
+                self.grid_dropdowns.append(combo)
+
+        # --- PANTALLA OLED: fila 0, columna 3 (junto al Botón 3) ---
+        self.oled_frame = ctk.CTkFrame(self.grid_frame, fg_color="#1a1a2e", border_width=1, border_color="#3b3b5c")
+        self.oled_frame.grid(row=0, column=3, padx=8, pady=6, sticky="n")
+
+        ctk.CTkLabel(self.oled_frame, text="🖥️ OLED", font=("Arial", 11, "bold")).pack(pady=(6, 4))
+
+        # Factor de escala: la pantalla real es 128x64
+        self.oled_scale = 1.0
+        self.oled_canvas_width = int(128 * self.oled_scale)
+        self.oled_canvas_height = int(64 * self.oled_scale)
+
+        self.oled_canvas = ctk.CTkCanvas(
+            self.oled_frame,
+            width=self.oled_canvas_width,
+            height=self.oled_canvas_height,
+            bg="black",
+            highlightthickness=1,
+            highlightbackground="#333333"
+        )
+        self.oled_canvas.pack(pady=(0, 8), padx=8)
+
+        # --- ENCODERS EC11: fila 1 (junto al Botón 6) y fila 2 (junto al Botón 9), columna 3 ---
+        # Cada encoder es una tarjeta angosta con resumen + botón que abre un popup horizontal
+        for enc_idx in range(NUM_ENCODERS):
+            self.build_encoder_summary_card(self.grid_frame, enc_idx, row=enc_idx + 1, column=3)
+
+        # Sincronización
+        self.sync_btn = ctk.CTkButton(self.right_panel, text="💾 Guardar Cambios en la Pico",
+                                       command=self.send_to_pico, font=("Arial", 14, "bold"),
+                                       height=40, fg_color="#1f538d")
+        self.sync_btn.pack(pady=(5, 15), padx=20, fill="x")
+
+    def build_encoder_summary_card(self, parent, enc_idx, row, column):
+        """Tarjeta angosta que muestra un resumen del encoder y abre un popup para configurarlo."""
+        card = ctk.CTkFrame(parent, fg_color="#1a1a2e", border_width=1, border_color="#3b3b5c")
+        card.grid(row=row, column=column, padx=8, pady=6, sticky="n")
+
+        ctk.CTkLabel(card, text=f"🎚️ Encoder {enc_idx+1}", font=("Arial", 11, "bold")).pack(pady=(8, 4), padx=8)
+
+        summary_lbl = ctk.CTkLabel(card, text="---", font=("Arial", 9), text_color="gray", justify="left")
+        summary_lbl.pack(pady=(0, 6), padx=8)
+
+        open_btn = ctk.CTkButton(
+            card, text="⚙️ Configurar", width=100, height=28,
+            fg_color="#1f538d",
+            command=lambda e=enc_idx: self.open_encoder_popup(e)
+        )
+        open_btn.pack(pady=(0, 8), padx=8)
+
+        self.encoder_cards[enc_idx] = {"summary_lbl": summary_lbl}
+
+    def update_encoder_summary(self, enc_idx):
+        """Refresca el texto resumen (CCW/CW/Push) de la tarjeta compacta de un encoder."""
+        if enc_idx not in self.encoder_cards:
+            return
+        layer = self.config_data["layers"][self.active_layer_index]
+        enc_cfg = layer["encoders"][enc_idx]
+        summary_text = f"⟲ {enc_cfg['ccw']}\n⟳ {enc_cfg['cw']}\n🔘 {enc_cfg['push']}"
+        self.encoder_cards[enc_idx]["summary_lbl"].configure(text=summary_text)
+
+    def open_encoder_popup(self, enc_idx):
+        """Abre una ventana emergente para configurar un encoder: el Push arriba, y CCW/CW
+        a cada lado de un ícono del encoder que representa hacia dónde gira cada uno."""
+        # Si ya está abierto, solo la trae al frente en vez de duplicarla
+        existing = self.encoder_popup_windows.get(enc_idx)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title(f"Encoder {enc_idx+1} - Configuración")
+        popup.geometry("420x320")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()  # modal, evita editar la capa mientras el popup está abierto
+
+        ctk.CTkLabel(popup, text=f"🎚️ Encoder {enc_idx+1}", font=("Arial", 14, "bold")).pack(pady=(15, 10))
+
+        widgets = {}
+
+        def build_action_column(parent, action_key, label_text):
+            col_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            ctk.CTkLabel(col_frame, text=label_text, font=("Arial", 10)).pack(pady=(0, 6))
+
+            current_val = self.get_target_value(("enc", enc_idx, action_key))
+            btn = ctk.CTkButton(
+                col_frame, text=current_val, width=120, height=35,
+                fg_color="#2b2b2b", hover_color="#3b3b3b",
+                command=lambda e=enc_idx, a=action_key: self.start_capturing(("enc", e, a))
+            )
+            btn.pack(pady=3)
+
+            combo = ctk.CTkOptionMenu(
+                col_frame, values=["Especial..."] + PRESET_SPECIAL_KEYS,
+                width=120, height=24, font=("Arial", 10),
+                command=lambda val, e=enc_idx, a=action_key: self.assign_preset(("enc", e, a), val)
+            )
+            combo.set("Especial...")
+            combo.pack(pady=3)
+
+            widgets[f"{action_key}_btn"] = btn
+            widgets[f"{action_key}_dd"] = combo
+            return col_frame
+
+        # --- ARRIBA: el botón pulsador (Push) ---
+        push_col = build_action_column(popup, "push", "🔘 Push")
+        push_col.pack(pady=(0, 15))
+
+        # --- MEDIO: CCW (izq) - ícono del encoder - CW (der) ---
+        middle_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        middle_frame.pack(pady=5)
+        middle_frame.grid_columnconfigure(0, weight=1)
+        middle_frame.grid_columnconfigure(1, weight=0)
+        middle_frame.grid_columnconfigure(2, weight=1)
+
+        ccw_col = build_action_column(middle_frame, "ccw", "⟲ Izq (CCW)")
+        ccw_col.grid(row=0, column=0, padx=12, sticky="n")
+
+        self.draw_encoder_icon(middle_frame).grid(row=0, column=1, padx=10, sticky="n")
+
+        cw_col = build_action_column(middle_frame, "cw", "⟳ Der (CW)")
+        cw_col.grid(row=0, column=2, padx=12, sticky="n")
+
+        self.encoder_popup_widgets[enc_idx] = widgets
+        self.encoder_popup_windows[enc_idx] = popup
+
+        def on_close():
+            self.capturing_target = None
+            self.encoder_popup_widgets.pop(enc_idx, None)
+            self.encoder_popup_windows.pop(enc_idx, None)
+            self.update_encoder_summary(enc_idx)
+            popup.grab_release()
+            popup.destroy()
+
+        close_btn = ctk.CTkButton(popup, text="Cerrar", command=on_close, fg_color="#1f538d")
+        close_btn.pack(pady=15)
+
+        popup.protocol("WM_DELETE_WINDOW", on_close)
+
+    def draw_encoder_icon(self, parent):
+        """Dibuja un pequeño ícono del encoder EC11 (perilla + flechas de giro) para mostrar
+        en el medio del popup, entre las opciones de CCW y CW."""
+        size = 84
+        canvas = ctk.CTkCanvas(parent, width=size, height=size, bg="#1a1a2e", highlightthickness=0)
+
+        cx, cy = size / 2, size / 2
+
+        # Flecha de giro hacia la izquierda (CCW)
+        canvas.create_arc(6, 6, size - 6, size - 6, start=110, extent=90,
+                           style="arc", outline="#5dade2", width=3)
+        canvas.create_line(10, 30, 6, 22, 16, 20, fill="#5dade2", width=3,
+                            capstyle="round", joinstyle="round")
+
+        # Flecha de giro hacia la derecha (CW)
+        canvas.create_arc(6, 6, size - 6, size - 6, start=-20, extent=90,
+                           style="arc", outline="#5dade2", width=3)
+        canvas.create_line(size - 10, 30, size - 6, 22, size - 16, 20, fill="#5dade2", width=3,
+                            capstyle="round", joinstyle="round")
+
+        # Cuerpo de la perilla (knob) del encoder
+        knob_r = size * 0.28
+        canvas.create_oval(cx - knob_r - 3, cy - knob_r - 3 + 6, cx + knob_r + 3, cy + knob_r + 3 + 6,
+                            fill="#2b2b2b", outline="#555555", width=2)
+        canvas.create_oval(cx - knob_r, cy - knob_r + 6, cx + knob_r, cy + knob_r + 6,
+                            fill="#3b3b3b", outline="#666666")
+        # Marca indicadora de posición, apuntando hacia arriba
+        canvas.create_line(cx, cy + 6, cx, cy - knob_r + 4 + 6, fill="white", width=3, capstyle="round")
+
+        # Eje/vástago hacia abajo (representa el botón pulsador)
+        canvas.create_rectangle(cx - 3, cy + knob_r + 3, cx + 3, cy + knob_r + 14,
+                                 fill="#555555", outline="")
+
+        return canvas
+
+
+
+    def close_all_encoder_popups(self):
+        """Cierra cualquier popup de encoder abierto, por ejemplo al cambiar de capa."""
+        for enc_idx, popup in list(self.encoder_popup_windows.items()):
+            try:
+                if popup.winfo_exists():
+                    popup.grab_release()
+                    popup.destroy()
+            except Exception:
+                pass
+        self.encoder_popup_widgets.clear()
+        self.encoder_popup_windows.clear()
+
+    # ------------------------------------------------------------------
+    # Captura de teclas (generalizada para botones Y encoders)
+    # ------------------------------------------------------------------
+    def start_capturing(self, target):
+        """Prepara el widget objetivo y lanza el hilo de captura segura (anti-bloqueos)."""
+        self.capturing_target = target
+
+        # Resetear estilo de todos los widgets capturables, y resaltar el activo
+        for i in range(9):
+            if target == ("btn", i):
+                self.grid_buttons[i].configure(text="⌨️ Escuchando...", fg_color="darkorange", hover_color="orange")
+            else:
+                self.restore_widget_style(("btn", i))
+
+        for e_idx, widgets in self.encoder_popup_widgets.items():
+            for action in ("ccw", "cw", "push"):
+                t = ("enc", e_idx, action)
+                if target == t:
+                    widgets[f"{action}_btn"].configure(text="⌨️ Escuchando...", fg_color="darkorange", hover_color="orange")
+                else:
+                    self.restore_widget_style(t)
+
+        # Ejecutar lectura de teclado en un hilo secundario para no congelar la UI visual de Tkinter
+        threading.Thread(target=self._capture_thread, args=(target,), daemon=True).start()
+
+    def _capture_thread(self, target):
+        """Captura global que desactiva el paso del atajo al resto de programas."""
+        try:
+            # 1. Forzar limpieza de la memoria interna antes de leer
+            # (evita que se sumen modificadores de pulsaciones anteriores)
+            keyboard._pressed_events.clear()
+
+            # suppress=True evita que se abran otros programas al configurar
+            raw_shortcut = keyboard.read_hotkey(suppress=True)
+
+            # 2. Forzar limpieza después de capturar para soltar virtualmente las teclas
+            keyboard._pressed_events.clear()
+
+            # 3. Si por rebote capta secuencias separadas por coma (ej: "ctrl+c, ctrl+c"),
+            # nos quedamos solo con la primera instrucción limpia.
+            raw_shortcut = raw_shortcut.split(',')[0].strip()
+
+            # Volvemos al hilo principal de Tkinter para aplicar los cambios visuales
+            self.after(0, lambda: self._apply_captured_key(target, raw_shortcut))
+        except Exception as e:
+            print(f"Error al capturar la tecla: {e}")
+            self.after(0, lambda: self.restore_widget_style(target))
+
+    def _format_shortcut(self, raw_shortcut):
+        """Traduce el formato interno de keyboard a la sintaxis limpia de Keycode."""
+        parts = raw_shortcut.split('+')
+        formatted_parts = []
+
+        # Diccionario para mapear las teclas al formato de CircuitPython
+        KEY_MAP = {
+            "enter": "ENTER",
+            "esc": "ESC",
+            "backspace": "BACKSPACE",
+            "tab": "TAB",
+            "space": "SPACE",
+            "delete": "DEL",
+            "up": "UP_ARROW",
+            "down": "DOWN_ARROW",
+            "left": "LEFT_ARROW",
+            "right": "RIGHT_ARROW",
+            "print screen": "PRINTSCREEN",
+            "windows": "Win",
+            "ctrl": "Ctrl",
+            "shift": "Shift",
+            "alt": "Alt",
+            "alt gr": "Alt"
+        }
+
+        for part in parts:
+            p = part.strip().lower()
+            if p in KEY_MAP:
+                formatted_parts.append(KEY_MAP[p])
+            else:
+                formatted_parts.append(p.upper())
+
+        return "+".join(formatted_parts)
+
+    def _apply_captured_key(self, target, raw_shortcut):
+        """Impacta los cambios de la tecla generada dentro de la configuración visual."""
+        # Evita una sobrescritura si el usuario cambió de capa/target antes de presionar una tecla
+        if self.capturing_target != target:
+            return
+
+        clean_shortcut = self._format_shortcut(raw_shortcut)
+        self.set_target_value(target, clean_shortcut)
+        self.capturing_target = None
+        self.restore_widget_style(target)
+        if target[0] == "enc":
+            self.update_encoder_summary(target[1])
+
+    # ------------------------------------------------------------------
+    # Helpers genéricos target <-> config_data / widgets
+    # ------------------------------------------------------------------
+    def get_target_value(self, target):
+        layer = self.config_data["layers"][self.active_layer_index]
+        if target[0] == "btn":
+            _, idx = target
+            return layer["keys"][idx]
+        else:
+            _, enc_idx, action = target
+            return layer["encoders"][enc_idx][action]
+
+    def set_target_value(self, target, value):
+        layer = self.config_data["layers"][self.active_layer_index]
+        if target[0] == "btn":
+            _, idx = target
+            layer["keys"][idx] = value
+        else:
+            _, enc_idx, action = target
+            layer["encoders"][enc_idx][action] = value
+
+    def get_target_button_widget(self, target):
+        if target[0] == "btn":
+            return self.grid_buttons[target[1]]
+        else:
+            _, enc_idx, action = target
+            widgets = self.encoder_popup_widgets.get(enc_idx)
+            if widgets is None:
+                return None
+            return widgets.get(f"{action}_btn")
+
+    def get_target_dropdown_widget(self, target):
+        if target[0] == "btn":
+            return self.grid_dropdowns[target[1]]
+        else:
+            _, enc_idx, action = target
+            widgets = self.encoder_popup_widgets.get(enc_idx)
+            if widgets is None:
+                return None
+            return widgets.get(f"{action}_dd")
+
+    def restore_widget_style(self, target):
+        widget = self.get_target_button_widget(target)
+        if widget is None or not widget.winfo_exists():
+            return  # el popup del encoder está cerrado; no hay nada que actualizar visualmente
+        val = self.get_target_value(target)
+        widget.configure(text=val, fg_color="#2b2b2b", hover_color="#3b3b3b")
+
+    def assign_preset(self, target, selected_val):
+        if selected_val.startswith("---") or selected_val == "Especial...":
+            return
+        self.set_target_value(target, selected_val)
+        self.restore_widget_style(target)
+        dropdown = self.get_target_dropdown_widget(target)
+        if dropdown is not None and dropdown.winfo_exists():
+            dropdown.set("Especial...")
+        if target[0] == "enc":
+            self.update_encoder_summary(target[1])
+
+    # ------------------------------------------------------------------
+    # Capas
+    # ------------------------------------------------------------------
+    def refresh_layers_list(self):
+        for widget in self.layers_scroll.winfo_children():
+            widget.destroy()
+
+        for idx, layer in enumerate(self.config_data["layers"]):
+            is_active = (idx == self.active_layer_index)
+            btn_color = "#1f538d" if is_active else "#333333"
+
+            icon_symbol = layer.get("icon", "MONITOR")
+            btn = ctk.CTkButton(
+                self.layers_scroll,
+                text=f"#{idx} [{icon_symbol}] {layer['name']}",
+                fg_color=btn_color,
+                anchor="w",
+                command=lambda i=idx: self.select_layer(i)
+            )
+            btn.pack(pady=4, fill="x")
+
+        self.load_layer_into_editor(self.active_layer_index)
+
+    def select_layer(self, index):
+        self.active_layer_index = index
+        self.capturing_target = None  # Resetea el tracker si se cambia de capa
+        self.close_all_encoder_popups()  # evita editar el encoder de la capa anterior por error
+        self.refresh_layers_list()
+
+    def load_layer_into_editor(self, index):
+        layer = self.config_data["layers"][index]
+        self.layer_name_entry.delete(0, "end")
+        self.layer_name_entry.insert(0, layer["name"])
+
+        current_icon = layer.get("icon", "MONITOR")
+        self.icon_menu.set(current_icon if current_icon in AVAILABLE_ICONS else "MONITOR")
+
+        # El botón "Editar" ahora funciona para cualquier ícono: los personalizados abren
+        # su bitmap guardado, y los íconos base se rasterizan como punto de partida editable.
+        self.btn_edit_icon.configure(state="normal", fg_color="#555555")
+
+        for i in range(9):
+            val = layer["keys"][i] if i < len(layer["keys"]) else "F1"
+            self.grid_buttons[i].configure(text=val, fg_color="#2b2b2b", hover_color="#3b3b3b")
+            self.grid_dropdowns[i].set("Especial...")
+
+        encoders = layer.get("encoders", default_encoders())
+        for e_idx in range(NUM_ENCODERS):
+            if e_idx >= len(encoders):
+                layer.setdefault("encoders", []).append({"ccw": "F1", "cw": "F1", "push": "F1"})
+            self.update_encoder_summary(e_idx)
+
+        self.refresh_oled_preview()
+
+    def update_active_layer_name(self, event=None):
+        new_name = self.layer_name_entry.get().upper()
+        self.config_data["layers"][self.active_layer_index]["name"] = new_name
+        self.refresh_layers_list()
+
+    def update_active_layer_icon(self, selected_icon):
+        if selected_icon == NEW_ICON_SENTINEL:
+            self.open_new_icon_popup()
+            return
+        self.config_data["layers"][self.active_layer_index]["icon"] = selected_icon
+        self.refresh_layers_list()
+
+    def open_new_icon_popup(self):
+        """Popup para dar de alta un ícono nuevo: nombre + mini editor de píxeles 16x16."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Nuevo Ícono")
+        popup.geometry("300x470")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()
+
+        ctk.CTkLabel(popup, text="➕ Nombre del nuevo ícono", font=("Arial", 13, "bold")).pack(pady=(15, 4))
+        ctk.CTkLabel(popup, text="Solo letras, números y '_'", font=("Arial", 9), text_color="gray").pack(pady=(0, 6))
+
+        entry = ctk.CTkEntry(popup, width=220, placeholder_text="Ej: WIFI, BATTERY, HEART")
+        entry.pack(pady=(0, 10))
+        entry.focus()
+
+        ctk.CTkLabel(popup, text="🎨 Dibujá el ícono (16x16 px)", font=("Arial", 11, "bold")).pack(pady=(0, 2))
+        ctk.CTkLabel(popup, text="Click para pintar/borrar, arrastrá para dibujar varios", font=("Arial", 8), text_color="gray").pack(pady=(0, 6))
+
+        # --- Mini editor de píxeles ---
+        grid_size = 16
+        cell_px = 11
+        canvas_size = grid_size * cell_px
+
+        editor_canvas = ctk.CTkCanvas(
+            popup, width=canvas_size, height=canvas_size,
+            bg="black", highlightthickness=1, highlightbackground="#333333"
+        )
+        editor_canvas.pack(pady=(0, 8))
+
+        icon_grid = [[0] * grid_size for _ in range(grid_size)]
+        cell_rects = {}
+
+        for r in range(grid_size):
+            for c in range(grid_size):
+                x0, y0 = c * cell_px, r * cell_px
+                x1, y1 = x0 + cell_px, y0 + cell_px
+                rect_id = editor_canvas.create_rectangle(x0, y0, x1, y1, fill="black", outline="#222222")
+                cell_rects[(r, c)] = rect_id
+
+        # Al hacer click se decide si esa "pasada" pinta o borra, y el arrastre respeta esa decisión
+        paint_state = {"value": 1}
+
+        def set_pixel(r, c, value):
+            icon_grid[r][c] = value
+            editor_canvas.itemconfig(cell_rects[(r, c)], fill="white" if value == 1 else "black")
+
+        def cell_from_event(event):
+            c = event.x // cell_px
+            r = event.y // cell_px
+            if 0 <= r < grid_size and 0 <= c < grid_size:
+                return r, c
+            return None
+
+        def on_click(event):
+            pos = cell_from_event(event)
+            if pos is None:
+                return
+            r, c = pos
+            paint_state["value"] = 0 if icon_grid[r][c] == 1 else 1
+            set_pixel(r, c, paint_state["value"])
+
+        def on_drag(event):
+            pos = cell_from_event(event)
+            if pos is None:
+                return
+            r, c = pos
+            set_pixel(r, c, paint_state["value"])
+
+        editor_canvas.bind("<Button-1>", on_click)
+        editor_canvas.bind("<B1-Motion>", on_drag)
+
+        def clear_grid():
+            for r in range(grid_size):
+                for c in range(grid_size):
+                    set_pixel(r, c, 0)
+
+        ctk.CTkButton(popup, text="🧹 Limpiar dibujo", width=110, height=24,
+                      command=clear_grid, fg_color="#555555").pack(pady=(0, 6))
+
+        status_lbl = ctk.CTkLabel(popup, text="", text_color="orange", font=("Arial", 10))
+        status_lbl.pack(pady=(0, 4))
+
+        def revert_dropdown():
+            # Vuelve el desplegable al ícono actual de la capa, sin dejarlo trabado en el sentinel
+            current_icon = self.config_data["layers"][self.active_layer_index].get("icon", "MONITOR")
+            self.icon_menu.set(current_icon)
+
+        def confirm(event=None):
+            name = entry.get().strip().upper().replace(" ", "_")
+            if not name:
+                status_lbl.configure(text="Ingresá un nombre.")
+                return
+            if not name.replace("_", "").isalnum():
+                status_lbl.configure(text="Solo letras, números y '_'.")
+                return
+            if name in AVAILABLE_ICONS:
+                status_lbl.configure(text="Ese ícono ya existe.")
+                return
+
+            # Guarda el bitmap dibujado. Si quedó vacío, el preview cae al ícono genérico como respaldo.
+            self.config_data.setdefault("custom_icons", {})[name] = [row[:] for row in icon_grid]
+
+            AVAILABLE_ICONS.append(name)
+            self.icon_menu.configure(values=AVAILABLE_ICONS + [NEW_ICON_SENTINEL])
+            self.icon_menu.set(name)
+            self.config_data["layers"][self.active_layer_index]["icon"] = name
+            self.refresh_layers_list()
+
+            popup.grab_release()
+            popup.destroy()
+
+        def cancel():
+            revert_dropdown()
+            popup.grab_release()
+            popup.destroy()
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="✅ Agregar", command=confirm, fg_color="#1f538d").pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancelar", command=cancel, fg_color="firebrick", hover_color="darkred").pack(side="left", padx=5)
+
+        popup.protocol("WM_DELETE_WINDOW", cancel)
+
+    def edit_current_icon(self):
+        """Abre el editor de píxeles para el ícono de la capa activa (personalizado o base)."""
+        current_icon = self.config_data["layers"][self.active_layer_index].get("icon", "MONITOR")
+        self.open_edit_icon_popup(current_icon)
+
+    def open_edit_icon_popup(self, icon_name):
+        """Popup para modificar el bitmap de un ícono personalizado ya existente (no permite renombrarlo)."""
+        popup = ctk.CTkToplevel(self)
+        popup.title(f"Editar Ícono: {icon_name}")
+        popup.geometry("300x460")
+        popup.resizable(False, False)
+        popup.transient(self)
+        popup.grab_set()
+
+        ctk.CTkLabel(popup, text=f"✏️ Editando: {icon_name}", font=("Arial", 13, "bold")).pack(pady=(15, 4))
+        ctk.CTkLabel(popup, text="🎨 Modificá el dibujo (16x16 px)", font=("Arial", 11, "bold")).pack(pady=(6, 2))
+        ctk.CTkLabel(popup, text="Click para pintar/borrar, arrastrá para dibujar varios", font=("Arial", 8), text_color="gray").pack(pady=(0, 6))
+
+        es_conversion = icon_name not in self.config_data.get("custom_icons", {})
+        if es_conversion:
+            ctk.CTkLabel(popup, text="💡 Este ícono base se convertirá en personalizado al guardar",
+                         font=("Arial", 8), text_color="#5dade2", wraplength=260, justify="center").pack(pady=(0, 4))
+
+        # --- Mini editor de píxeles, precargado con el bitmap existente ---
+        grid_size = 16
+        cell_px = 11
+        canvas_size = grid_size * cell_px
+
+        editor_canvas = ctk.CTkCanvas(
+            popup, width=canvas_size, height=canvas_size,
+            bg="black", highlightthickness=1, highlightbackground="#333333"
+        )
+        editor_canvas.pack(pady=(0, 8))
+
+        existing_bitmap = self.config_data.get("custom_icons", {}).get(icon_name)
+        if existing_bitmap and len(existing_bitmap) == grid_size:
+            icon_grid = [row[:] for row in existing_bitmap]
+        else:
+            # No hay bitmap propio todavía: si es un ícono base con arte por código, lo rasterizamos
+            # como punto de partida editable; si no, arranca en blanco.
+            icon_grid = self.rasterize_builtin_icon(icon_name)
+
+        cell_rects = {}
+        for r in range(grid_size):
+            for c in range(grid_size):
+                x0, y0 = c * cell_px, r * cell_px
+                x1, y1 = x0 + cell_px, y0 + cell_px
+                initial_color = "white" if icon_grid[r][c] == 1 else "black"
+                rect_id = editor_canvas.create_rectangle(x0, y0, x1, y1, fill=initial_color, outline="#222222")
+                cell_rects[(r, c)] = rect_id
+
+        paint_state = {"value": 1}
+
+        def set_pixel(r, c, value):
+            icon_grid[r][c] = value
+            editor_canvas.itemconfig(cell_rects[(r, c)], fill="white" if value == 1 else "black")
+
+        def cell_from_event(event):
+            c = event.x // cell_px
+            r = event.y // cell_px
+            if 0 <= r < grid_size and 0 <= c < grid_size:
+                return r, c
+            return None
+
+        def on_click(event):
+            pos = cell_from_event(event)
+            if pos is None:
+                return
+            r, c = pos
+            paint_state["value"] = 0 if icon_grid[r][c] == 1 else 1
+            set_pixel(r, c, paint_state["value"])
+
+        def on_drag(event):
+            pos = cell_from_event(event)
+            if pos is None:
+                return
+            r, c = pos
+            set_pixel(r, c, paint_state["value"])
+
+        editor_canvas.bind("<Button-1>", on_click)
+        editor_canvas.bind("<B1-Motion>", on_drag)
+
+        def clear_grid():
+            for r in range(grid_size):
+                for c in range(grid_size):
+                    set_pixel(r, c, 0)
+
+        ctk.CTkButton(popup, text="🧹 Limpiar dibujo", width=110, height=24,
+                      command=clear_grid, fg_color="#555555").pack(pady=(0, 10))
+
+        def save_changes():
+            self.config_data["custom_icons"][icon_name] = [row[:] for row in icon_grid]
+            # Si la capa activa usa este ícono, refresca la vista previa OLED al toque
+            active_layer = self.config_data["layers"][self.active_layer_index]
+            if active_layer.get("icon") == icon_name:
+                self.refresh_oled_preview()
+            self.refresh_layers_list()  # refresca por si otra capa en la lista lo usa como ícono visible
+            popup.grab_release()
+            popup.destroy()
+
+        def cancel():
+            popup.grab_release()
+            popup.destroy()
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=10)
+        ctk.CTkButton(btn_frame, text="💾 Guardar Cambios", command=save_changes, fg_color="#1f538d").pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancelar", command=cancel, fg_color="firebrick", hover_color="darkred").pack(side="left", padx=5)
+
+        popup.protocol("WM_DELETE_WINDOW", cancel)
+
+    def add_layer(self):
+        new_index = len(self.config_data["layers"])
+        new_layer = {
+            "name": f"CAPA_{new_index}",
+            "icon": "MONITOR",
+            "keys": ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9"],
+            "encoders": default_encoders()
+        }
+        self.config_data["layers"].append(new_layer)
+        self.select_layer(new_index)
+
+    def delete_layer(self):
+        if len(self.config_data["layers"]) <= 1:
+            self.status_lbl.configure(text="¡Debes mantener al menos 1 capa!", text_color="orange")
+            return
+
+        del self.config_data["layers"][self.active_layer_index]
+        self.active_layer_index = max(0, self.active_layer_index - 1)
+        self.refresh_layers_list()
+
+    # ------------------------------------------------------------------
+    # Guardar / Cargar configuración (archivo .json local)
+    # ------------------------------------------------------------------
+    def save_config_to_file(self):
+        """Guarda toda la config_data (capas, botones, encoders, íconos custom) en un .json local."""
+        path = filedialog.asksaveasfilename(
+            title="Guardar configuración del Macropad",
+            defaultextension=".json",
+            filetypes=[("Archivo JSON", "*.json"), ("Todos los archivos", "*.*")]
+        )
+        if not path:
+            return  # el usuario canceló el diálogo
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.config_data, f, indent=2, ensure_ascii=False)
+            self.status_lbl.configure(text="💾 Configuración guardada ✅", text_color="lightgreen")
+        except Exception as e:
+            self.status_lbl.configure(text=f"Error al guardar: {e}", text_color="red")
+
+    def load_config_from_file(self):
+        """Carga una config_data guardada previamente y refresca toda la UI con esos datos."""
+        path = filedialog.askopenfilename(
+            title="Cargar configuración del Macropad",
+            defaultextension=".json",
+            filetypes=[("Archivo JSON", "*.json"), ("Todos los archivos", "*.*")]
+        )
+        if not path:
+            return  # el usuario canceló el diálogo
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except Exception as e:
+            self.status_lbl.configure(text=f"Error al leer el archivo: {e}", text_color="red")
+            return
+
+        # Validación básica de estructura
+        if not isinstance(loaded, dict) or "layers" not in loaded or not isinstance(loaded["layers"], list) or len(loaded["layers"]) == 0:
+            self.status_lbl.configure(text="⚠️ Archivo inválido: falta 'layers'", text_color="orange")
+            return
+
+        # Rellena campos faltantes por si el archivo viene de una versión anterior de la app
+        for layer in loaded["layers"]:
+            layer.setdefault("name", "CAPA")
+            layer.setdefault("icon", "MONITOR")
+            layer.setdefault("keys", ["F1"] * 9)
+            while len(layer["keys"]) < 9:
+                layer["keys"].append("F1")
+            layer.setdefault("encoders", default_encoders())
+            while len(layer["encoders"]) < NUM_ENCODERS:
+                layer["encoders"].append({"ccw": "F1", "cw": "F1", "push": "F1"})
+        loaded.setdefault("custom_icons", {})
+
+        # Cierra cualquier popup de encoder abierto antes de reemplazar todo
+        self.close_all_encoder_popups()
+        self.capturing_target = None
+
+        self.config_data = loaded
+        self.active_layer_index = 0
+
+        # Registra en el desplegable cualquier ícono (custom o no) que venga en el archivo
+        icons_in_file = set(self.config_data["custom_icons"].keys())
+        icons_in_file.update(layer.get("icon", "MONITOR") for layer in self.config_data["layers"])
+        for icon_name in icons_in_file:
+            if icon_name not in AVAILABLE_ICONS:
+                AVAILABLE_ICONS.append(icon_name)
+        self.icon_menu.configure(values=AVAILABLE_ICONS + [NEW_ICON_SENTINEL])
+
+        self.refresh_layers_list()
+        self.status_lbl.configure(text="📂 Configuración cargada ✅", text_color="lightgreen")
+
+    # ------------------------------------------------------------------
+    # Simulador de pantalla OLED (128x64)
+    # ------------------------------------------------------------------
+    def draw_oled_text(self, text, x, y, font_size=8):
+        """Simula la función display.text de Adafruit SSD1306"""
+        self.oled_canvas.create_text(
+            x * self.oled_scale,
+            y * self.oled_scale,
+            text=text,
+            fill="white",
+            anchor="nw",
+            font=("Courier New", int(font_size * self.oled_scale), "bold")
+        )
+
+    def draw_fill_rect(self, x, y, w, h, color):
+        """Simula display.fill_rect(x, y, w, h, color) donde 1 es blanco y 0 es negro"""
+        fill_color = "white" if color == 1 else "black"
+        self.oled_canvas.create_rectangle(
+            x * self.oled_scale,
+            y * self.oled_scale,
+            (x + w) * self.oled_scale,
+            (y + h) * self.oled_scale,
+            fill=fill_color,
+            outline=""
+        )
+
+    def draw_fill_circle(self, cx, cy, r, color):
+        """Simula un círculo relleno (para íconos redondeados: botones de gamepad, notas musicales, etc.)"""
+        fill_color = "white" if color == 1 else "black"
+        s = self.oled_scale
+        self.oled_canvas.create_oval(
+            (cx - r) * s, (cy - r) * s,
+            (cx + r) * s, (cy + r) * s,
+            fill=fill_color, outline=""
+        )
+
+    def refresh_oled_preview(self):
+        """Vuelve a dibujar la pantalla OLED simulada según la capa activa (ícono + nombre)."""
+        if not hasattr(self, "oled_canvas"):
+            return
+
+        layer = self.config_data["layers"][self.active_layer_index]
+        self.oled_canvas.delete("all")
+
+        # Título superior fijo
+        self.draw_oled_text("- MACROPAD v0.9 -", 10, 2, font_size=7)
+
+        # Dibuja el ícono correspondiente: primero un bitmap custom dibujado a mano,
+        # luego el arte pixel-art propio, y como último recurso uno genérico
+        icon = layer.get("icon", "MONITOR")
+        if icon in self.config_data.get("custom_icons", {}):
+            self.draw_custom_icon(icon)
+        else:
+            draw_func = getattr(self, f"draw_icon_{icon.lower()}", None)
+            if callable(draw_func):
+                draw_func()
+            else:
+                self.draw_icon_generic(icon)
+
+        # Nombre de la capa al lado del ícono
+        name = layer.get("name", "")[:10]
+        self.draw_oled_text(name, 26, 18, font_size=8)
+
+    def draw_icon_camera(self):
+        """Ícono de cámara (Cuerpo + Lente) - usado por defecto en la capa STREAM"""
+        self.draw_fill_rect(4, 16, 10, 8, 1)   # Cuerpo de la cámara
+        self.draw_fill_rect(14, 18, 3, 4, 1)   # Lente frontal
+
+    def draw_icon_monitor(self):
+        """Ícono de monitor/pantalla con base"""
+        self.draw_fill_rect(3, 15, 16, 10, 1)  # Marco externo de la pantalla
+        self.draw_fill_rect(5, 17, 12, 6, 0)   # Área interior (negra)
+        self.draw_fill_rect(9, 25, 4, 2, 1)    # Cuello del pie
+        self.draw_fill_rect(6, 27, 10, 2, 1)   # Base
+
+    def draw_icon_gamepad(self):
+        """Ícono de gamepad (cuerpo + botones)"""
+        self.draw_fill_rect(3, 18, 16, 8, 1)   # Cuerpo del control
+        self.draw_fill_circle(15, 20, 2, 0)    # Botón hueco superior
+        self.draw_fill_circle(18, 23, 2, 0)    # Botón hueco derecho
+        self.draw_fill_rect(6, 21, 4, 1, 0)    # Cruceta horizontal
+        self.draw_fill_rect(7, 20, 1, 3, 0)    # Cruceta vertical
+
+    def draw_icon_music(self):
+        """Ícono de nota musical"""
+        self.draw_fill_rect(13, 14, 1, 12, 1)  # Palo de la nota
+        self.draw_fill_rect(13, 14, 5, 1, 1)   # Barra superior (corchea)
+        self.draw_fill_circle(10, 27, 3, 1)    # Cabeza de la nota
+
+    def draw_icon_folder(self):
+        """Ícono de carpeta"""
+        self.draw_fill_rect(4, 20, 4, 2, 1)    # Pestaña
+        self.draw_fill_rect(4, 22, 16, 8, 1)   # Cuerpo de la carpeta
+
+    def draw_icon_code(self):
+        """Ícono de código, dibujado como texto '</>' """
+        self.draw_oled_text("</>", 3, 17, font_size=9)
+
+    def draw_icon_generic(self, icon_name):
+        """Ícono genérico de respaldo: si un ícono custom quedó sin dibujo, muestra un recuadro
+        con las primeras 2 letras del nombre adentro."""
+        self.draw_fill_rect(3, 15, 16, 12, 1)   # Marco externo
+        self.draw_fill_rect(5, 17, 12, 8, 0)    # Interior negro
+        abbrev = icon_name[:2] if len(icon_name) >= 2 else icon_name
+        self.draw_oled_text(abbrev, 6, 18, font_size=6)
+
+    def draw_custom_icon(self, name):
+        """Dibuja el bitmap 16x16 que el usuario armó en el mini editor de píxeles."""
+        bitmap = self.config_data.get("custom_icons", {}).get(name)
+        if not bitmap or not any(any(row) for row in bitmap):
+            # No dibujó nada: cae al ícono genérico con las iniciales
+            self.draw_icon_generic(name)
+            return
+        for r, row_pixels in enumerate(bitmap):
+            for c, val in enumerate(row_pixels):
+                if val:
+                    self.draw_fill_rect(4 + c, 14 + r, 1, 1, 1)
+
+    def rasterize_builtin_icon(self, icon_name):
+        """Convierte el dibujo por código de un ícono base (cámara, monitor, gamepad, etc.) en una
+        matriz de píxeles 16x16, para usarla como punto de partida editable en el mini editor.
+        Si el ícono no tiene un rasterizado conocido (ej. CODE, que es texto), devuelve una grilla vacía."""
+        grid_size = 16
+        grid = [[0] * grid_size for _ in range(grid_size)]
+
+        def fill_rect(x, y, w, h, color):
+            for gy in range(grid_size):
+                wy = 14 + gy
+                if not (y <= wy < y + h):
+                    continue
+                for gx in range(grid_size):
+                    wx = 4 + gx
+                    if x <= wx < x + w:
+                        grid[gy][gx] = color
+
+        def fill_circle(cx, cy, r, color):
+            for gy in range(grid_size):
+                wy = 14 + gy
+                for gx in range(grid_size):
+                    wx = 4 + gx
+                    if (wx + 0.5 - cx) ** 2 + (wy + 0.5 - cy) ** 2 <= r * r:
+                        grid[gy][gx] = color
+
+        icon = icon_name.upper()
+        if icon == "CAMERA":
+            fill_rect(4, 16, 10, 8, 1)
+            fill_rect(14, 18, 3, 4, 1)
+        elif icon == "MONITOR":
+            fill_rect(3, 15, 16, 10, 1)
+            fill_rect(5, 17, 12, 6, 0)
+            fill_rect(9, 25, 4, 2, 1)
+            fill_rect(6, 27, 10, 2, 1)
+        elif icon == "GAMEPAD":
+            fill_rect(3, 18, 16, 8, 1)
+            fill_circle(15, 20, 2, 0)
+            fill_circle(18, 23, 2, 0)
+            fill_rect(6, 21, 4, 1, 0)
+            fill_rect(7, 20, 1, 3, 0)
+        elif icon == "MUSIC":
+            fill_rect(13, 14, 1, 12, 1)
+            fill_rect(13, 14, 5, 1, 1)
+            fill_circle(10, 27, 3, 1)
+        elif icon == "FOLDER":
+            fill_rect(4, 20, 4, 2, 1)
+            fill_rect(4, 22, 16, 8, 1)
+        # CODE (texto "</>"), íconos genéricos sin dibujo propio, o nombres desconocidos:
+        # no hay un rasterizado confiable, así que arranca en blanco para dibujar a mano.
+
+        return grid
+
+
+    def reconnect_pico(self):
+        """Cierra la conexión serial actual (si la hay) y vuelve a escanear los puertos COM desde cero.
+        Corre en un hilo aparte para no congelar la UI mientras escanea/abre el puerto."""
+        self.btn_reconnect.configure(state="disabled", text="🔄 Buscando...")
+        self.status_lbl.configure(text="🔄 Buscando Pico...", text_color="yellow")
+
+        def _scan():
+            if self.serial_port is not None:
+                try:
+                    if self.serial_port.is_open:
+                        self.serial_port.close()
+                except Exception:
+                    pass
+                self.serial_port = None
+
+            self.find_pico_port()
+            self.after(0, lambda: self.btn_reconnect.configure(state="normal", text="🔄 Reconectar"))
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def find_pico_port(self):
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            if "CircuitPython" in port.description or "Board" in port.description or "USB Serial" in port.description:
+                try:
+                    self.serial_port = serial.Serial(port.device, 115200, timeout=1)
+                    self.after(0, lambda p=port.device: self.status_lbl.configure(text=f"Conectado: {p} ✅", text_color="lightgreen"))
+                    return
+                except Exception:
+                    pass
+        self.after(0, lambda: self.status_lbl.configure(text="Pico no encontrada ❌", text_color="red"))
+
+    def send_to_pico(self):
+        if not self.serial_port or not self.serial_port.is_open:
+            self.find_pico_port()
+            if not self.serial_port:
+                return
+
+        try:
+            json_payload = json.dumps(self.config_data) + "\n"
+            self.serial_port.write(json_payload.encode('utf-8'))
+            self.status_lbl.configure(text="¡Atajos e Íconos Guardados! 🎉", text_color="cyan")
+        except Exception as e:
+            self.status_lbl.configure(text=f"Error al enviar datos: {e}", text_color="red")
+
+
+if __name__ == "__main__":
+    app = MacropadConfigurator()
+    app.mainloop()
